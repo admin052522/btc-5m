@@ -67,8 +67,8 @@
   <div class="card">
     <div style="font-size:14px;margin-bottom:8px;">运行状态</div>
     <div style="font-size:12px;color:var(--sub);line-height:1.8;" id="run-info">
-      运行模式：自动容灾切换<br>
-      若实时连接被拦截，将自动降级为 3 秒轮询更新。
+      运行模式：多重指标动态预测<br>
+      由于网络限制，数据自动降级为轮询更新。
     </div>
   </div>
 </div>
@@ -87,22 +87,12 @@ let candles = [];
 let chart, candleSeries;
 let pollTimer = null;
 
-// ===================== 多重数据源获取 =====================
+// ===================== 多重数据源 =====================
 async function fetchData() {
-  // 定义三个数据源，依次尝试
   const sources = [
-    { 
-      url: "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=200", 
-      parse: (d) => d.data.reverse().map(r => ({ time: +r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5] })) 
-    },
-    { 
-      url: "https://api.huobi.pro/market/history/kline?symbol=btcusdt&period=5min&size=200", 
-      parse: (d) => d.data.reverse().map(r => ({ time: r.id, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.amount })) 
-    },
-    { 
-      url: "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=200", 
-      parse: (d) => d.map(r => ({ time: r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5] })) 
-    }
+    { url: "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=200", parse: (d) => d.data.reverse().map(r => ({ time: +r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5] })) },
+    { url: "https://api.huobi.pro/market/history/kline?symbol=btcusdt&period=5min&size=200", parse: (d) => d.data.reverse().map(r => ({ time: r.id, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.amount })) },
+    { url: "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=200", parse: (d) => d.map(r => ({ time: r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5] })) }
   ];
 
   for (let s of sources) {
@@ -112,12 +102,11 @@ async function fetchData() {
       if (data && (data.data || Array.isArray(data))) {
         return s.parse(data);
       }
-    } catch(e) { console.log("源失败，尝试下一个"); }
+    } catch(e) {}
   }
-  throw new Error("所有数据源均不可用");
+  throw new Error("数据源不可用");
 }
 
-// ===================== 初始化图表 =====================
 function initChart() {
   chart = LightweightCharts.createChart(
     document.getElementById("chart"),
@@ -133,100 +122,49 @@ function initChart() {
   });
 }
 
-// ===================== 主加载逻辑 =====================
 async function loadHistory() {
   document.getElementById("status").textContent = "加载中…";
   try {
     candles = await fetchData();
     candleSeries.setData(candles);
     chart.timeScale().fitContent();
-    document.getElementById("status").textContent = "● 已加载";
+    document.getElementById("status").textContent = "● 实时(轮询)";
     runPrediction(candles[candles.length - 1]);
-    // 如果获取成功，启动 WebSocket 实时和轮询保底
-    connectWS();
+    startPolling(); // 直接启动轮询，确保国内网络绝对有数据
   } catch (e) {
     document.getElementById("status").textContent = "● 网络被拦截";
-    document.getElementById("run-info").innerHTML = "<span style='color:red'>当前网络无法访问交易所，请尝试切换 Wi-Fi 或开启代理。</span>";
   }
 }
 
-// ===================== WebSocket 及 自动轮询降级 =====================
-function connectWS() {
-  const ws = new WebSocket("wss://ws.okx.com:8443/ws/v5/public");
-  let connected = false;
-
-  ws.onopen = () => { 
-    connected = true;
-    document.getElementById("status").textContent = "● 实时";
-    if (pollTimer) clearInterval(pollTimer); // 如果 WS 连上了，关掉轮询
-    ws.send(JSON.stringify({ op: "subscribe", args: [{ channel: "candle5m", instId: "BTC-USDT" }] }));
-  };
-
-  ws.onmessage = (ev) => {
-    const json = JSON.parse(ev.data);
-    if (json.arg && json.arg.channel === "candle5m" && json.data) {
-      const d = json.data[0];
-      const isClosed = d[8] === "1";
-      const bar = { time: +d[0]/1000, open: +d[1], high: +d[2], low: +d[3], close: +d[4], volume: +d[5] };
-      
-      candleSeries.update(bar);
-      const idx = candles.findIndex(c => c.time === bar.time);
-      if (idx >= 0) candles[idx] = bar; else candles.push(bar);
-
-      if (isClosed) { settlePending(bar); runPrediction(bar); }
-    }
-  };
-  
-  ws.onerror = () => { ws.close(); };
-  ws.onclose = () => {
-    if (connected) {
-      document.getElementById("status").textContent = "● 重连中…";
-      setTimeout(connectWS, 5000); 
-    }
-  };
-
-  // 【核心保底】：如果 4 秒内 WebSocket 没连上，直接改用 REST 轮询
-  setTimeout(() => {
-    if (!connected) {
-      document.getElementById("status").textContent = "● 轮询模式";
-      ws.close();
-      startPolling();
-    }
-  }, 4000);
-}
-
-async function startPolling() {
+function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  
   pollTimer = setInterval(async () => {
     try {
       const newCandles = await fetchData();
       const lastBar = newCandles[newCandles.length - 1];
-      
       candleSeries.update(lastBar);
+      
       const idx = candles.findIndex(c => c.time === lastBar.time);
       if (idx >= 0) candles[idx] = lastBar; else candles.push(lastBar);
       
-      // 检查上一根是否已经收盘
       const prevBar = candles[candles.length - 2];
       if (prevBar && !prevBar.settled) {
           settlePending(lastBar);
           prevBar.settled = true;
       }
       runPrediction(lastBar);
-
     } catch(e) {}
-  }, 3000); // 每 3 秒拉取一次
+  }, 3000);
 }
 
-// ===================== 指标与逻辑 =====================
+// ===================== 核心指标 =====================
 function calcEMA(arr, p) {
   if (arr.length < p) return null;
   const k = 2/(p+1); let e = arr.slice(0,p).reduce((a,b)=>a+b,0)/p;
   for (let i=p;i<arr.length;i++) e = arr[i]*k + e*(1-k);
   return e;
 }
-function calcRSI(arr, p=7) {
+function calcRSI(arr, p=14) {
   if (arr.length < p+1) return null;
   let g=0, l=0;
   for (let i=arr.length-p;i<arr.length;i++) {
@@ -243,47 +181,92 @@ function calcBB(arr, p=20, m=2) {
   return { upper: mean+m*sd, lower: mean-m*sd, mid: mean };
 }
 
+// ===================== 升级版预测引擎 =====================
 function runPrediction(candle) {
   if (candles.length < 30) return;
   const closes = candles.map(c=>c.close); const last = candle.close;
 
-  const rsi = calcRSI(closes,7); const e9  = calcEMA(closes,9);
-  const e20 = calcEMA(closes,20); const bb  = calcBB(closes,20,2);
+  const rsi = calcRSI(closes, 14); 
+  const e9  = calcEMA(closes, 9);
+  const e20 = calcEMA(closes, 20);
+  const bb  = calcBB(closes, 20, 2);
 
-  let score = 0; const reasons = [];
+  let score = 0;
+  const reasons = [];
 
-  if (rsi !== null) {
-    if (rsi < 30)      { score += 2;   reasons.push(`RSI ${rsi.toFixed(1)} 超卖`); }
-    else if (rsi > 70) { score -= 2;   reasons.push(`RSI ${rsi.toFixed(1)} 超买`); }
-    else if (rsi < 40) { score += 0.5; reasons.push(`RSI ${rsi.toFixed(1)} 偏弱`); }
-    else if (rsi > 60) { score -= 0.5; reasons.push(`RSI ${rsi.toFixed(1)} 偏强`); }
-  }
+  // 1. 趋势判断 (EMA)
   if (e9 !== null && e20 !== null) {
-    if (e9 > e20) { score += 1.5; reasons.push("EMA9 > EMA20"); }
-    else          { score -= 1.5; reasons.push("EMA9 < EMA20"); }
-  }
-  if (bb !== null) {
-    if (last <= bb.lower)      { score += 1; reasons.push("触及布林下轨"); }
-    else if (last >= bb.upper) { score -= 1; reasons.push("触及布林上轨"); }
+    if (e9 > e20) { score += 1; reasons.push("短期均线偏多"); }
+    else          { score -= 1; reasons.push("短期均线偏空"); }
   }
 
-  let dir, prob, cls;
-  if (score >= 2)       { dir = "偏多 ↑"; prob = 0.65; cls = "green"; }
-  else if (score >= 0.5) { dir = "偏多 ↑"; prob = 0.56; cls = "green"; }
-  else if (score <= -2)  { dir = "偏空 ↓"; prob = 0.65; cls = "red"; }
-  else if (score <= -0.5){ dir = "偏空 ↓"; prob = 0.56; cls = "red"; }
-  else                   { dir = "中性 →"; prob = 0.50; cls = "yellow"; }
+  // 2. K线相对位置 (Price vs EMA9)
+  if (e9 !== null) {
+    if (last > e9) { score += 0.5; }
+    else           { score -= 0.5; }
+  }
+
+  // 3. RSI 动量判断 (参数改为14，更经典)
+  if (rsi !== null) {
+    if (rsi < 30)      { score += 2;   reasons.push(`RSI ${rsi.toFixed(1)} 严重超卖`); }
+    else if (rsi > 70) { score -= 2;   reasons.push(`RSI ${rsi.toFixed(1)} 严重超买`); }
+    else if (rsi > 50) { score += 0.5; reasons.push("RSI 多头占优"); }
+    else               { score -= 0.5; reasons.push("RSI 空头占优"); }
+  }
+
+  // 4. 布林带 位置
+  if (bb !== null) {
+    if (last <= bb.lower)      { score += 1.5; reasons.push("触及布林下轨(支撑)"); }
+    else if (last >= bb.upper) { score -= 1.5; reasons.push("触及布林上轨(阻力)"); }
+  }
+
+  // 5. 连续K线形态 (最近3根)
+  let upCount = 0;
+  let downCount = 0;
+  for (let i = candles.length - 3; i < candles.length; i++) {
+    if (candles[i].close > candles[i].open) upCount++;
+    else if (candles[i].close < candles[i].open) downCount++;
+  }
+  if (upCount >= 2) { score += 1; reasons.push("短期连阳动能"); }
+  if (downCount >= 2) { score -= 1; reasons.push("短期连阴动能"); }
+
+  // ================= 动态概率计算 =================
+  let dir, cls, finalProb;
+  
+  if (score >= 0.8) {
+    dir = "偏多 ↑";
+    cls = "green";
+    // 评分越高，概率越大，限制在 53% - 75% 之间
+    finalProb = 0.50 + Math.min(0.25, score * 0.04); 
+  } else if (score <= -0.8) {
+    dir = "偏空 ↓";
+    cls = "red";
+    finalProb = 0.50 + Math.min(0.25, Math.abs(score) * 0.04);
+  } else {
+    dir = "中性 →";
+    cls = "yellow";
+    finalProb = 0.50;
+  }
 
   const dirEl = document.getElementById("live-dir");
   dirEl.textContent = dir; dirEl.className = "dir " + cls;
-  document.getElementById("live-prob").textContent = `模型概率：${(prob*100).toFixed(1)}% · 评分 ${score.toFixed(1)}`;
+  document.getElementById("live-prob").textContent = `模型概率：${(finalProb*100).toFixed(1)}% · 评分 ${score.toFixed(1)}`;
   document.getElementById("live-reasons").innerHTML = reasons.map(r=>`· ${r}`).join("<br>") || "信号混合，观望";
 
+  // 记录预测
   if (dir !== "中性 →") {
     const records = loadRecords();
-    // 防重复记录
-    if(records.length === 0 || records[records.length-1].time !== candle.time) {
-        records.push({ time: candle.time, dir: dir.includes("多") ? "UP" : "DOWN", prob: prob, startPrice: candle.close, result: null });
+    const lastRecord = records[records.length - 1];
+    
+    // 防止重复记录同一根K线
+    if (!lastRecord || lastRecord.time !== candle.time) {
+        records.push({ 
+            time: candle.time, 
+            dir: dir.includes("多") ? "UP" : "DOWN", 
+            prob: finalProb, 
+            startPrice: candle.close, 
+            result: null 
+        });
         saveRecords(records); renderRecords(); renderStats();
     }
   }
