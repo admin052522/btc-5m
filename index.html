@@ -67,7 +67,7 @@
   <div class="card">
     <div style="font-size:14px;margin-bottom:8px;">运行状态</div>
     <div style="font-size:12px;color:var(--sub);line-height:1.8;" id="run-info">
-      数据源：欧易 OKX (国内直连)<br>
+      数据源：OKX (支持直连与代理)<br>
       每一根 5 分钟 K 线收盘时，自动生成预测并记录。
     </div>
   </div>
@@ -83,21 +83,39 @@
 
 <script>
 // @ts-nocheck
-// ===================== 配置 (OKX 欧易数据源) =====================
-const REST_URL = `https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=200`;
+const BASE_URL = `https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=200`;
 const WS_URL   = `wss://ws.okx.com:8443/ws/v5/public`;
 
 let candles = [];
 let chart, candleSeries;
 
-function loadRecords() {
-  try { return JSON.parse(localStorage.getItem("btc5m_records")) || []; }
-  catch(e) { return []; }
-}
-function saveRecords(records) {
-  localStorage.setItem("btc5m_records", JSON.stringify(records));
+// ===================== 核心：带代理的请求 =====================
+async function fetchWithProxy(url) {
+  // 1. 尝试直连
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data && data.data) return data;
+  } catch (e) { console.log("直连失败，尝试代理1"); }
+
+  // 2. 尝试代理 1
+  try {
+    const res = await fetch("https://api.allorigins.win/raw?url=" + encodeURIComponent(url));
+    const data = await res.json();
+    if (data && data.data) return data;
+  } catch (e) { console.log("代理1失败，尝试代理2"); }
+
+  // 3. 尝试代理 2
+  try {
+    const res = await fetch("https://corsproxy.io/?" + encodeURIComponent(url));
+    const data = await res.json();
+    if (data && data.data) return data;
+  } catch (e) { console.log("代理2失败"); }
+  
+  throw new Error("所有网络均失败");
 }
 
+// ===================== 初始化图表 =====================
 function initChart() {
   chart = LightweightCharts.createChart(
     document.getElementById("chart"),
@@ -113,79 +131,59 @@ function initChart() {
   });
 }
 
+// ===================== 加载历史 K 线 =====================
 async function loadHistory() {
+  document.getElementById("status").textContent = "加载中…";
   try {
-    const res = await fetch(REST_URL);
-    const json = await res.json();
-    // OKX 返回的数据是倒序的，需要 reverse
-    const raw = json.data.reverse();
+    const json = await fetchWithProxy(BASE_URL);
+    const raw = json.data.reverse(); // OKX 是倒序
     candles = raw.map(r => ({
-      time: r[0]/1000, 
-      open: +r[1], 
-      high: +r[2], 
-      low: +r[3], 
-      close: +r[4], 
-      volume: +r[5]
+      time: r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5]
     }));
     candleSeries.setData(candles);
     chart.timeScale().fitContent();
     document.getElementById("status").textContent = "● 已加载";
     runPrediction(candles[candles.length - 1]);
   } catch (e) {
-    console.error(e);
     document.getElementById("status").textContent = "● 加载失败";
   }
 }
 
+// ===================== WebSocket (带轮询降级) =====================
 function connectWS() {
-  const ws = new WebSocket(WS_URL);
+  let ws = new WebSocket(WS_URL);
   
   ws.onopen = () => { 
     document.getElementById("status").textContent = "● 实时";
-    // 订阅 OKX 的 5m K 线频道
-    const msg = {
-      op: "subscribe",
-      args: [{ channel: "candle5m", instId: "BTC-USDT" }]
-    };
-    ws.send(JSON.stringify(msg));
+    ws.send(JSON.stringify({ op: "subscribe", args: [{ channel: "candle5m", instId: "BTC-USDT" }] }));
   };
 
   ws.onmessage = (ev) => {
     const json = JSON.parse(ev.data);
     if (json.arg && json.arg.channel === "candle5m" && json.data) {
       const d = json.data[0];
-      const isClosed = d[8] === "1"; // OKX 的字段：1 代表已收盘
-      const bar = {
-        time: +d[0]/1000,
-        open: +d[1],
-        high: +d[2],
-        low: +d[3],
-        close: +d[4],
-        volume: +d[5]
-      };
+      const isClosed = d[8] === "1";
+      const bar = { time: +d[0]/1000, open: +d[1], high: +d[2], low: +d[3], close: +d[4], volume: +d[5] };
       
       candleSeries.update(bar);
       const idx = candles.findIndex(c => c.time === bar.time);
       if (idx >= 0) candles[idx] = bar; else candles.push(bar);
 
-      if (isClosed) { 
-        settlePending(bar);      
-        runPrediction(bar);      
-      }
+      if (isClosed) { settlePending(bar); runPrediction(bar); }
     }
   };
   
+  ws.onerror = () => { ws.close(); };
   ws.onclose = () => {
     document.getElementById("status").textContent = "● 重连中…";
-    setTimeout(connectWS, 3000);
+    setTimeout(connectWS, 5000); // 5秒后重连
   };
-  ws.onerror = () => ws.close();
 }
 
+// ===================== 指标与逻辑 =====================
 function calcEMA(arr, p) {
   if (arr.length < p) return null;
-  const k = 2/(p+1);
-  let e = arr.slice(0,p).reduce((a,b)=>a+b,0)/p;
+  const k = 2/(p+1); let e = arr.slice(0,p).reduce((a,b)=>a+b,0)/p;
   for (let i=p;i<arr.length;i++) e = arr[i]*k + e*(1-k);
   return e;
 }
@@ -201,24 +199,19 @@ function calcRSI(arr, p=7) {
 }
 function calcBB(arr, p=20, m=2) {
   if (arr.length < p) return null;
-  const sl = arr.slice(-p);
-  const mean = sl.reduce((a,b)=>a+b,0)/p;
+  const sl = arr.slice(-p); const mean = sl.reduce((a,b)=>a+b,0)/p;
   const sd = Math.sqrt(sl.reduce((a,b)=>a+(b-mean)**2,0)/p);
   return { upper: mean+m*sd, lower: mean-m*sd, mid: mean };
 }
 
 function runPrediction(candle) {
   if (candles.length < 30) return;
-  const closes = candles.map(c=>c.close);
-  const last = candle.close;
+  const closes = candles.map(c=>c.close); const last = candle.close;
 
-  const rsi = calcRSI(closes,7);
-  const e9  = calcEMA(closes,9);
-  const e20 = calcEMA(closes,20);
-  const bb  = calcBB(closes,20,2);
+  const rsi = calcRSI(closes,7); const e9  = calcEMA(closes,9);
+  const e20 = calcEMA(closes,20); const bb  = calcBB(closes,20,2);
 
-  let score = 0;
-  const reasons = [];
+  let score = 0; const reasons = [];
 
   if (rsi !== null) {
     if (rsi < 30)      { score += 2;   reasons.push(`RSI ${rsi.toFixed(1)} 超卖`); }
@@ -243,53 +236,40 @@ function runPrediction(candle) {
   else                   { dir = "中性 →"; prob = 0.50; cls = "yellow"; }
 
   const dirEl = document.getElementById("live-dir");
-  dirEl.textContent = dir;
-  dirEl.className = "dir " + cls;
+  dirEl.textContent = dir; dirEl.className = "dir " + cls;
   document.getElementById("live-prob").textContent = `模型概率：${(prob*100).toFixed(1)}% · 评分 ${score.toFixed(1)}`;
   document.getElementById("live-reasons").innerHTML = reasons.map(r=>`· ${r}`).join("<br>") || "信号混合，观望";
 
   if (dir !== "中性 →") {
     const records = loadRecords();
-    records.push({
-      time: candle.time,
-      dir: dir.includes("多") ? "UP" : "DOWN",
-      prob: prob,
-      startPrice: candle.close,
-      result: null, 
-    });
-    saveRecords(records);
-    renderRecords();
-    renderStats();
+    records.push({ time: candle.time, dir: dir.includes("多") ? "UP" : "DOWN", prob: prob, startPrice: candle.close, result: null });
+    saveRecords(records); renderRecords(); renderStats();
   }
 }
 
+// ===================== 存储与渲染 =====================
+function loadRecords() { try { return JSON.parse(localStorage.getItem("btc5m_records")) || []; } catch(e) { return []; } }
+function saveRecords(records) { localStorage.setItem("btc5m_records", JSON.stringify(records)); }
+
 function settlePending(closedCandle) {
-  const records = loadRecords();
-  let changed = false;
+  const records = loadRecords(); let changed = false;
   records.forEach(r => {
     if (r.result === null && r.time < closedCandle.time) {
-      r.result = closedCandle.close > r.startPrice ? "UP" : "DOWN";
-      changed = true;
+      r.result = closedCandle.close > r.startPrice ? "UP" : "DOWN"; changed = true;
     }
   });
   if (changed) { saveRecords(records); renderRecords(); renderStats(); }
 }
 
 function renderStats() {
-  const records = loadRecords().filter(r => r.result !== null);
-  const total = records.length;
+  const records = loadRecords().filter(r => r.result !== null); const total = records.length;
   if (total === 0) {
-    document.getElementById("ov-total").textContent = "0";
-    document.getElementById("ov-winrate").textContent = "0%";
-    document.getElementById("ov-up").textContent = "0%";
-    document.getElementById("ov-down").textContent = "0%";
-    return;
+    document.getElementById("ov-total").textContent = "0"; document.getElementById("ov-winrate").textContent = "0%";
+    document.getElementById("ov-up").textContent = "0%"; document.getElementById("ov-down").textContent = "0%"; return;
   }
   const wins = records.filter(r => r.dir === r.result).length;
-  const up = records.filter(r => r.dir === "UP");
-  const down = records.filter(r => r.dir === "DOWN");
-  const upWin = up.filter(r => r.result === "UP").length;
-  const downWin = down.filter(r => r.result === "DOWN").length;
+  const up = records.filter(r => r.dir === "UP"); const down = records.filter(r => r.dir === "DOWN");
+  const upWin = up.filter(r => r.result === "UP").length; const downWin = down.filter(r => r.result === "DOWN").length;
 
   document.getElementById("ov-total").textContent = total;
   document.getElementById("ov-winrate").textContent = (wins/total*100).toFixed(1) + "%";
@@ -298,19 +278,15 @@ function renderStats() {
 }
 
 function renderRecords() {
-  const records = loadRecords().slice().reverse();
-  const box = document.getElementById("record-list");
+  const records = loadRecords().slice().reverse(); const box = document.getElementById("record-list");
   if (records.length === 0) { box.innerHTML = '<div style="color:var(--sub);text-align:center;padding:40px;">暂无记录，等待 K 线收盘…</div>'; return; }
 
   box.innerHTML = records.map(r => {
-    const t = new Date(r.time*1000);
-    const hh = String(t.getHours()).padStart(2,"0");
-    const mm = String(t.getMinutes()).padStart(2,"0");
+    const t = new Date(r.time*1000); const hh = String(t.getHours()).padStart(2,"0"); const mm = String(t.getMinutes()).padStart(2,"0");
     let badge, actual;
     if (r.result === null) { badge = '<span class="badge badge-pending">待结算</span>'; actual = "—"; }
     else if (r.dir === r.result) { badge = '<span class="badge badge-hit">命中</span>'; actual = r.result === "UP" ? '<span class="green">实际上涨</span>' : '<span class="red">实际下跌</span>'; }
     else { badge = '<span class="badge badge-miss">未命中</span>'; actual = r.result === "UP" ? '<span class="green">实际上涨</span>' : '<span class="red">实际下跌</span>'; }
-
     const dirTxt = r.dir === "UP" ? '<span class="green">预判上涨</span>' : '<span class="red">预判下跌</span>';
     return `<div class="record-item">
       <div class="record-head"><span>${hh}:${mm}</span>${badge}</div>
@@ -323,8 +299,7 @@ document.querySelectorAll(".tab").forEach(t => {
   t.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
     document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
-    t.classList.add("active");
-    document.getElementById("page-" + t.dataset.page).classList.add("active");
+    t.classList.add("active"); document.getElementById("page-" + t.dataset.page).classList.add("active");
   });
 });
 
