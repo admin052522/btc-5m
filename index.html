@@ -67,8 +67,8 @@
   <div class="card">
     <div style="font-size:14px;margin-bottom:8px;">运行状态</div>
     <div style="font-size:12px;color:var(--sub);line-height:1.8;" id="run-info">
-      数据源：OKX (支持直连与代理)<br>
-      每一根 5 分钟 K 线收盘时，自动生成预测并记录。
+      运行模式：自动容灾切换<br>
+      若实时连接被拦截，将自动降级为 3 秒轮询更新。
     </div>
   </div>
 </div>
@@ -83,36 +83,38 @@
 
 <script>
 // @ts-nocheck
-const BASE_URL = `https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=200`;
-const WS_URL   = `wss://ws.okx.com:8443/ws/v5/public`;
-
 let candles = [];
 let chart, candleSeries;
+let pollTimer = null;
 
-// ===================== 核心：带代理的请求 =====================
-async function fetchWithProxy(url) {
-  // 1. 尝试直连
-  try {
-    const res = await fetch(url);
-    const data = await res.json();
-    if (data && data.data) return data;
-  } catch (e) { console.log("直连失败，尝试代理1"); }
+// ===================== 多重数据源获取 =====================
+async function fetchData() {
+  // 定义三个数据源，依次尝试
+  const sources = [
+    { 
+      url: "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=200", 
+      parse: (d) => d.data.reverse().map(r => ({ time: +r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5] })) 
+    },
+    { 
+      url: "https://api.huobi.pro/market/history/kline?symbol=btcusdt&period=5min&size=200", 
+      parse: (d) => d.data.reverse().map(r => ({ time: r.id, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.amount })) 
+    },
+    { 
+      url: "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=200", 
+      parse: (d) => d.map(r => ({ time: r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5] })) 
+    }
+  ];
 
-  // 2. 尝试代理 1
-  try {
-    const res = await fetch("https://api.allorigins.win/raw?url=" + encodeURIComponent(url));
-    const data = await res.json();
-    if (data && data.data) return data;
-  } catch (e) { console.log("代理1失败，尝试代理2"); }
-
-  // 3. 尝试代理 2
-  try {
-    const res = await fetch("https://corsproxy.io/?" + encodeURIComponent(url));
-    const data = await res.json();
-    if (data && data.data) return data;
-  } catch (e) { console.log("代理2失败"); }
-  
-  throw new Error("所有网络均失败");
+  for (let s of sources) {
+    try {
+      const res = await fetch(s.url);
+      const data = await res.json();
+      if (data && (data.data || Array.isArray(data))) {
+        return s.parse(data);
+      }
+    } catch(e) { console.log("源失败，尝试下一个"); }
+  }
+  throw new Error("所有数据源均不可用");
 }
 
 // ===================== 初始化图表 =====================
@@ -131,30 +133,32 @@ function initChart() {
   });
 }
 
-// ===================== 加载历史 K 线 =====================
+// ===================== 主加载逻辑 =====================
 async function loadHistory() {
   document.getElementById("status").textContent = "加载中…";
   try {
-    const json = await fetchWithProxy(BASE_URL);
-    const raw = json.data.reverse(); // OKX 是倒序
-    candles = raw.map(r => ({
-      time: r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5]
-    }));
+    candles = await fetchData();
     candleSeries.setData(candles);
     chart.timeScale().fitContent();
     document.getElementById("status").textContent = "● 已加载";
     runPrediction(candles[candles.length - 1]);
+    // 如果获取成功，启动 WebSocket 实时和轮询保底
+    connectWS();
   } catch (e) {
-    document.getElementById("status").textContent = "● 加载失败";
+    document.getElementById("status").textContent = "● 网络被拦截";
+    document.getElementById("run-info").innerHTML = "<span style='color:red'>当前网络无法访问交易所，请尝试切换 Wi-Fi 或开启代理。</span>";
   }
 }
 
-// ===================== WebSocket (带轮询降级) =====================
+// ===================== WebSocket 及 自动轮询降级 =====================
 function connectWS() {
-  let ws = new WebSocket(WS_URL);
-  
+  const ws = new WebSocket("wss://ws.okx.com:8443/ws/v5/public");
+  let connected = false;
+
   ws.onopen = () => { 
+    connected = true;
     document.getElementById("status").textContent = "● 实时";
+    if (pollTimer) clearInterval(pollTimer); // 如果 WS 连上了，关掉轮询
     ws.send(JSON.stringify({ op: "subscribe", args: [{ channel: "candle5m", instId: "BTC-USDT" }] }));
   };
 
@@ -175,9 +179,44 @@ function connectWS() {
   
   ws.onerror = () => { ws.close(); };
   ws.onclose = () => {
-    document.getElementById("status").textContent = "● 重连中…";
-    setTimeout(connectWS, 5000); // 5秒后重连
+    if (connected) {
+      document.getElementById("status").textContent = "● 重连中…";
+      setTimeout(connectWS, 5000); 
+    }
   };
+
+  // 【核心保底】：如果 4 秒内 WebSocket 没连上，直接改用 REST 轮询
+  setTimeout(() => {
+    if (!connected) {
+      document.getElementById("status").textContent = "● 轮询模式";
+      ws.close();
+      startPolling();
+    }
+  }, 4000);
+}
+
+async function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  
+  pollTimer = setInterval(async () => {
+    try {
+      const newCandles = await fetchData();
+      const lastBar = newCandles[newCandles.length - 1];
+      
+      candleSeries.update(lastBar);
+      const idx = candles.findIndex(c => c.time === lastBar.time);
+      if (idx >= 0) candles[idx] = lastBar; else candles.push(lastBar);
+      
+      // 检查上一根是否已经收盘
+      const prevBar = candles[candles.length - 2];
+      if (prevBar && !prevBar.settled) {
+          settlePending(lastBar);
+          prevBar.settled = true;
+      }
+      runPrediction(lastBar);
+
+    } catch(e) {}
+  }, 3000); // 每 3 秒拉取一次
 }
 
 // ===================== 指标与逻辑 =====================
@@ -242,8 +281,11 @@ function runPrediction(candle) {
 
   if (dir !== "中性 →") {
     const records = loadRecords();
-    records.push({ time: candle.time, dir: dir.includes("多") ? "UP" : "DOWN", prob: prob, startPrice: candle.close, result: null });
-    saveRecords(records); renderRecords(); renderStats();
+    // 防重复记录
+    if(records.length === 0 || records[records.length-1].time !== candle.time) {
+        records.push({ time: candle.time, dir: dir.includes("多") ? "UP" : "DOWN", prob: prob, startPrice: candle.close, result: null });
+        saveRecords(records); renderRecords(); renderStats();
+    }
   }
 }
 
@@ -305,7 +347,6 @@ document.querySelectorAll(".tab").forEach(t => {
 
 initChart();
 loadHistory();
-connectWS();
 renderRecords();
 renderStats();
 </script>
