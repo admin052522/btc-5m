@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>BTC 5m 预测终端</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root{--bg:#0b0e11;--panel:#181a20;--text:#eaecef;--sub:#848e9c;--green:#0ecb81;--red:#f6465d;--yellow:#f0b90b;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding-bottom:70px;}
+  .topbar{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:var(--panel);position:sticky;top:0;z-index:10;}
+  .topbar h1{font-size:16px;}
+  .status{font-size:12px;color:var(--yellow);}
+  #chart{width:100vw;height:38vh;}
+  .tabs{display:flex;background:var(--panel);position:fixed;bottom:0;width:100%;z-index:20;border-top:1px solid #2b3139;}
+  .tab{flex:1;text-align:center;padding:12px 0;font-size:13px;color:var(--sub);cursor:pointer;}
+  .tab.active{color:var(--text);font-weight:600;border-bottom:2px solid var(--yellow);}
+  .page{display:none;padding:16px;}
+  .page.active{display:block;}
+  .card{background:var(--panel);border-radius:12px;padding:16px;margin-bottom:12px;border-left:4px solid var(--yellow);}
+  .dir{font-size:24px;font-weight:700;}
+  .prob{font-size:13px;color:var(--sub);margin-top:4px;}
+  .reasons{font-size:12px;color:var(--sub);margin-top:10px;line-height:1.7;}
+  .green{color:var(--green);} .red{color:var(--red);} .yellow{color:var(--yellow);}
+  .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .stat-box{background:var(--panel);border-radius:10px;padding:14px;text-align:center;}
+  .stat-box .num{font-size:26px;font-weight:700;}
+  .stat-box .label{font-size:11px;color:var(--sub);margin-top:4px;}
+  .record-item{background:var(--panel);border-radius:10px;padding:12px;margin-bottom:8px;font-size:13px;}
+  .record-head{display:flex;justify-content:space-between;margin-bottom:6px;}
+  .record-body{display:flex;justify-content:space-between;color:var(--sub);}
+  .badge{font-size:11px;padding:1px 6px;border-radius:4px;}
+  .badge-hit{background:rgba(14,203,129,0.15);color:var(--green);}
+  .badge-miss{background:rgba(246,70,93,0.15);color:var(--red);}
+  .badge-pending{background:rgba(240,185,11,0.15);color:var(--yellow);}
+  .disclaimer{font-size:10px;color:#5e6673;text-align:center;padding:16px;line-height:1.6;}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>BTC/USDT · 5m</h1>
+  <span class="status" id="status">连接中…</span>
+</div>
+
+<!-- 总览页 -->
+<div class="page active" id="page-overview">
+  <div class="card">
+    <div class="dir" id="live-dir">等待数据…</div>
+    <div class="prob" id="live-prob"></div>
+    <div class="reasons" id="live-reasons"></div>
+  </div>
+  <div class="stat-grid">
+    <div class="stat-box"><div class="num" id="ov-total">0</div><div class="label">累计发布</div></div>
+    <div class="stat-box"><div class="num" id="ov-winrate">0%</div><div class="label">总体准确率</div></div>
+    <div class="stat-box"><div class="num green" id="ov-up">0%</div><div class="label">上涨准确率</div></div>
+    <div class="stat-box"><div class="num red" id="ov-down">0%</div><div class="label">下跌准确率</div></div>
+  </div>
+  <div class="disclaimer">⚠ 技术指标仅供参考，不构成投资建议。5分钟级别噪声大，信号不具备确定性。</div>
+</div>
+
+<!-- 记录页 -->
+<div class="page" id="page-records">
+  <div id="record-list"></div>
+</div>
+
+<!-- 运行状态页 -->
+<div class="page" id="page-run">
+  <div class="card">
+    <div style="font-size:14px;margin-bottom:8px;">运行状态</div>
+    <div style="font-size:12px;color:var(--sub);line-height:1.8;" id="run-info">
+      等待 WebSocket 连接…<br>
+      每一根 5 分钟 K 线收盘时，自动生成预测并记录。
+    </div>
+  </div>
+</div>
+
+<div id="chart"></div>
+
+<div class="tabs">
+  <div class="tab active" data-page="overview">总览</div>
+  <div class="tab" data-page="records">记录</div>
+  <div class="tab" data-page="run">运行</div>
+</div>
+
+<script>
+// ===================== 配置 =====================
+const SYMBOL = "BTCUSDT";
+const INTERVAL = "5m";
+const REST_URL = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${INTERVAL}&limit=200`;
+const WS_URL   = `wss://stream.binance.com:9443/ws/${SYMBOL.toLowerCase()}@kline_${INTERVAL}`;
+
+let candles = [];
+let chart, candleSeries;
+
+// ===================== 本地存储（预测记录） =====================
+function loadRecords() {
+  try { return JSON.parse(localStorage.getItem("btc5m_records")) || []; }
+  catch(e) { return []; }
+}
+function saveRecords(records) {
+  localStorage.setItem("btc5m_records", JSON.stringify(records));
+}
+
+// ===================== 带 CORS 回退的 fetch =====================
+async function fetchWithFallback(url) {
+  try {
+    const res = await fetch(url);
+    if (res.ok) return res;
+    throw new Error("direct failed");
+  } catch (e) {
+    const proxyUrl = "https://corsproxy.io/?" + encodeURIComponent(url);
+    const res = await fetch(proxyUrl);
+    if (!res.ok) throw new Error("proxy failed");
+    return res;
+  }
+}
+
+// ===================== 初始化图表 =====================
+function initChart() {
+  chart = LightweightCharts.createChart(
+    document.getElementById("chart"),
+    {
+      layout: { background: { color: "#0b0e11" }, textColor: "#eaecef" },
+      grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
+      timeScale: { timeVisible: true, secondsVisible: false },
+    }
+  );
+  candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+    upColor: "#0ecb81", downColor: "#f6465d", borderVisible: false,
+    wickUpColor: "#0ecb81", wickDownColor: "#f6465d",
+  });
+}
+
+// ===================== 加载历史 K 线 =====================
+async function loadHistory() {
+  try {
+    const res = await fetchWithFallback(REST_URL);
+    const raw = await res.json();
+    candles = raw.map(r => ({
+      time: r[0]/1000, open: +r[1], high: +r[2], low: +r[3], close: +r[4], volume: +r[5],
+    }));
+    candleSeries.setData(candles);
+    chart.timeScale().fitContent();
+    document.getElementById("status").textContent = "● 已加载";
+    runPrediction(candles[candles.length - 1]);
+  } catch (e) {
+    document.getElementById("status").textContent = "● 加载失败";
+  }
+}
+
+// ===================== WebSocket =====================
+function connectWS() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = () => { document.getElementById("status").textContent = "● 实时"; };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    const k = msg.k;
+    const bar = { time: k.t/1000, open:+k.o, high:+k.h, low:+k.l, close:+k.c, volume:+k.v };
+    candleSeries.update(bar);
+    const idx = candles.findIndex(c => c.time === bar.time);
+    if (idx >= 0) candles[idx] = bar; else candles.push(bar);
+
+    if (k.x) { // 收盘时
+      settlePending(bar);      // 先结算上一根
+      runPrediction(bar);      // 再生成新预测
+    }
+  };
+  ws.onclose = () => {
+    document.getElementById("status").textContent = "● 重连中…";
+    setTimeout(connectWS, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ===================== 技术指标 =====================
+function calcEMA(arr, p) {
+  if (arr.length < p) return null;
+  const k = 2/(p+1);
+  let e = arr.slice(0,p).reduce((a,b)=>a+b,0)/p;
+  for (let i=p;i<arr.length;i++) e = arr[i]*k + e*(1-k);
+  return e;
+}
+function calcRSI(arr, p=7) {
+  if (arr.length < p+1) return null;
+  let g=0, l=0;
+  for (let i=arr.length-p;i<arr.length;i++) {
+    const d = arr[i]-arr[i-1];
+    if (d>=0) g+=d; else l-=d;
+  }
+  const rs = l===0?100:g/l;
+  return 100 - 100/(1+rs);
+}
+function calcBB(arr, p=20, m=2) {
+  if (arr.length < p) return null;
+  const sl = arr.slice(-p);
+  const mean = sl.reduce((a,b)=>a+b,0)/p;
+  const sd = Math.sqrt(sl.reduce((a,b)=>a+(b-mean)**2,0)/p);
+  return { upper: mean+m*sd, lower: mean-m*sd, mid: mean };
+}
+
+// ===================== 预测 + 概率 =====================
+function runPrediction(candle) {
+  if (candles.length < 30) return;
+  const closes = candles.map(c=>c.close);
+  const last = candle.close;
+
+  const rsi = calcRSI(closes,7);
+  const e9  = calcEMA(closes,9);
+  const e20 = calcEMA(closes,20);
+  const bb  = calcBB(closes,20,2);
+
+  let score = 0;
+  const reasons = [];
+
+  // RSI(7)
+  if (rsi !== null) {
+    if (rsi < 30)      { score += 2;   reasons.push(`RSI ${rsi.toFixed(1)} 超卖`); }
+    else if (rsi > 70) { score -= 2;   reasons.push(`RSI ${rsi.toFixed(1)} 超买`); }
+    else if (rsi < 40) { score += 0.5; reasons.push(`RSI ${rsi.toFixed(1)} 偏弱`); }
+    else if (rsi > 60) { score -= 0.5; reasons.push(`RSI ${rsi.toFixed(1)} 偏强`); }
+  }
+  // EMA(9/20)
+  if (e9 !== null && e20 !== null) {
+    if (e9 > e20) { score += 1.5; reasons.push("EMA9 > EMA20"); }
+    else          { score -= 1.5; reasons.push("EMA9 < EMA20"); }
+  }
+  // 布林带
+  if (bb !== null) {
+    if (last <= bb.lower)      { score += 1; reasons.push("触及布林下轨"); }
+    else if (last >= bb.upper) { score -= 1; reasons.push("触及布林上轨"); }
+  }
+
+  // 方向 & 概率（基于评分映射，参考类似引擎的概率校准逻辑）
+  let dir, prob, cls;
+  if (score >= 2)       { dir = "偏多 ↑"; prob = 0.65; cls = "green"; }
+  else if (score >= 0.5) { dir = "偏多 ↑"; prob = 0.56; cls = "green"; }
+  else if (score <= -2)  { dir = "偏空 ↓"; prob = 0.65; cls = "red"; }
+  else if (score <= -0.5){ dir = "偏空 ↓"; prob = 0.56; cls = "red"; }
+  else                   { dir = "中性 →"; prob = 0.50; cls = "yellow"; }
+
+  // 更新总览卡片
+  const dirEl = document.getElementById("live-dir");
+  dirEl.textContent = dir;
+  dirEl.className = "dir " + cls;
+  document.getElementById("live-prob").textContent = `模型概率：${(prob*100).toFixed(1)}% · 评分 ${score.toFixed(1)}`;
+  document.getElementById("live-reasons").innerHTML = reasons.map(r=>`· ${r}`).join("<br>") || "信号混合，观望";
+
+  // 记录预测（非中性才记录，避免噪声）
+  if (dir !== "中性 →") {
+    const records = loadRecords();
+    records.push({
+      time: candle.time,
+      dir: dir.includes("多") ? "UP" : "DOWN",
+      prob: prob,
+      startPrice: candle.close,
+      result: null, // pending
+    });
+    saveRecords(records);
+    renderRecords();
+    renderStats();
+  }
+}
+
+// ===================== 结算待定预测 =====================
+function settlePending(closedCandle) {
+  const records = loadRecords();
+  let changed = false;
+  records.forEach(r => {
+    if (r.result === null && r.time < closedCandle.time) {
+      r.result = closedCandle.close > r.startPrice ? "UP" : "DOWN";
+      changed = true;
+    }
+  });
+  if (changed) { saveRecords(records); renderRecords(); renderStats(); }
+}
+
+// ===================== 渲染统计 =====================
+function renderStats() {
+  const records = loadRecords().filter(r => r.result !== null);
+  const total = records.length;
+  if (total === 0) {
+    document.getElementById("ov-total").textContent = "0";
+    document.getElementById("ov-winrate").textContent = "0%";
+    document.getElementById("ov-up").textContent = "0%";
+    document.getElementById("ov-down").textContent = "0%";
+    return;
+  }
+  const wins = records.filter(r => r.dir === r.result).length;
+  const up = records.filter(r => r.dir === "UP");
+  const down = records.filter(r => r.dir === "DOWN");
+  const upWin = up.filter(r => r.result === "UP").length;
+  const downWin = down.filter(r => r.result === "DOWN").length;
+
+  document.getElementById("ov-total").textContent = total;
+  document.getElementById("ov-winrate").textContent = (wins/total*100).toFixed(1) + "%";
+  document.getElementById("ov-up").textContent   = up.length ? (upWin/up.length*100).toFixed(1)+"%" : "—";
+  document.getElementById("ov-down").textContent = down.length ? (downWin/down.length*100).toFixed(1)+"%" : "—";
+}
+
+// ===================== 渲染记录 =====================
+function renderRecords() {
+  const records = loadRecords().slice().reverse();
+  const box = document.getElementById("record-list");
+  if (records.length === 0) { box.innerHTML = '<div style="color:var(--sub);text-align:center;padding:40px;">暂无记录，等待 K 线收盘…</div>'; return; }
+
+  box.innerHTML = records.map(r => {
+    const t = new Date(r.time*1000);
+    const hh = String(t.getHours()).padStart(2,"0");
+    const mm = String(t.getMinutes()).padStart(2,"0");
+    let badge, actual;
+    if (r.result === null) { badge = '<span class="badge badge-pending">待结算</span>'; actual = "—"; }
+    else if (r.dir === r.result) { badge = '<span class="badge badge-hit">命中</span>'; actual = r.result === "UP" ? '<span class="green">实际上涨</span>' : '<span class="red">实际下跌</span>'; }
+    else { badge = '<span class="badge badge-miss">未命中</span>'; actual = r.result === "UP" ? '<span class="green">实际上涨</span>' : '<span class="red">实际下跌</span>'; }
+
+    const dirTxt = r.dir === "UP" ? '<span class="green">预判上涨</span>' : '<span class="red">预判下跌</span>';
+    return `<div class="record-item">
+      <div class="record-head"><span>${hh}:${mm}</span>${badge}</div>
+      <div class="record-body"><span>${dirTxt} · ${(r.prob*100).toFixed(1)}%</span><span>${actual}</span></div>
+    </div>`;
+  }).join("");
+}
+
+// ===================== Tab 切换 =====================
+document.querySelectorAll(".tab").forEach(t => {
+  t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
+    t.classList.add("active");
+    document.getElementById("page-" + t.dataset.page).classList.add("active");
+  });
+});
+
+// ===================== 启动 =====================
+initChart();
+loadHistory();
+connectWS();
+renderRecords();
+renderStats();
+</script>
+</body>
+</html>
